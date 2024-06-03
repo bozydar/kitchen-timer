@@ -2,6 +2,7 @@ from machine import Pin, SPI, PWM, ADC
 import framebuf
 import time
 import _thread
+from rotary_irq import RotaryIRQ
 
 C_WHITE = 0xffff
 C_BLACK = 0x0000
@@ -128,12 +129,13 @@ class Beep:
 
 
 class Timer:
-    def __init__(self, on_alarm):
+    def __init__(self, on_alarm, on_alarm_off):
         self.clock = None
         self.alarm_in = 0
         self.last_measure = self._seconds()
         self.running = False
         self.on_alarm = on_alarm
+        self.on_alarm_off = on_alarm_off
         self._in_alarm = False
 
     def current(self):
@@ -152,9 +154,10 @@ class Timer:
     def inc(self, seconds):
         self.alarm_in = max(0, self.alarm_in + seconds)
         print('alarm_in', self.alarm_in)
+        print('in_alarm', self._in_alarm)
         if self.alarm_in == 0 and not self._in_alarm:
             self.running = False
-            self._alarm()
+            self.in_alarm = True
 
     def inc_with_round(self, seconds):
         self.alarm_in = max(0, self.alarm_in + seconds - (self.alarm_in % 60))
@@ -165,13 +168,13 @@ class Timer:
 
     @in_alarm.setter
     def in_alarm(self, value):
+        if self._in_alarm != value:
+            if self.on_alarm is not None:
+                if value:
+                    self.on_alarm(self)
+                else:
+                    self.on_alarm_off(self)
         self._in_alarm = value
-
-    def _alarm(self):
-        print('alarm')
-        self._in_alarm = True
-        if self.on_alarm is not None:
-            self.on_alarm(self)
 
     def start(self):
         self.last_measure = self._seconds()
@@ -286,30 +289,22 @@ class SegmentedText(framebuf.FrameBuffer):
             self.vline(x_ + 1, y_ + 2, self.seg_size - 3, c)
 
 
-class Keys:
-    def __init__(self, on_key_pressed=None):
-        self.keyA = Pin(15, Pin.IN, Pin.PULL_UP)
-        self.keyB = Pin(17, Pin.IN, Pin.PULL_UP)
+class Key:
+    def __init__(self, pin_num, on_key=None):
+        self.pin = Pin(pin_num, Pin.IN, Pin.PULL_UP)
+        self.int_flag = 0        
+        self.pin.irq(trigger=Pin.IRQ_FALLING|Pin.IRQ_RISING, handler=self._on_key)
+        self.on_key = on_key
+        self._interrupt_flag = False
+        
+    def _on_key(self, pin):
+        if self._interrupt_flag:
+            return
 
-        self.keyAPressed = False
-        self.keyBPressed = False
-
-        self.on_key_pressed = on_key_pressed
-
-    def tick(self):
-        if self.keyA.value() == 0 and not self.keyAPressed:
-            self.keyAPressed = True
-            self._on_event('keyAPressed')
-        elif self.keyB.value() == 0 and not self.keyBPressed:
-            self.keyBPressed = True
-            self._on_event('keyBPressed')
-        elif self.keyAPressed or self.keyBPressed:
-            self.keyAPressed = False
-            self.keyBPressed = False
-
-    def _on_event(self, event_name):
-        if self.on_key_pressed:
-            self.on_key_pressed(self, event_name)
+        self._interrupt_flag = True
+        if self.on_key:
+            self.on_key(self, self.pin.value())
+        self._interrupt_flag = False
 
 
 class Screen:
@@ -317,76 +312,124 @@ class Screen:
         self._display = display
 
 
-class TimerScreen(Screen):
-    def __init__(self, *, keys: Keys, color: int, timer: Timer, display: OLED):
+class ScreenPresenter(Screen):
+    def __init__(self, *, color: int, display: OLED):
         super().__init__(display=display)
         self._color = color
-        self._timer = timer
-        self._keys = keys
-        self._pause_icon = PauseIcon(self._display)
+        self._is_paused = False
         self._segmented_text = SegmentedText(self._display)
+        self._pause_icon = PauseIcon(self._display)
+        self._text = ''
 
     def show(self):
-        if self._keys.keyAPressed:
-            self._timer.inc_with_round(60)
-            self._timer.in_alarm = False
-            self._timer.pause()
-        if self._keys.keyBPressed:
-            self._timer.in_alarm = False
-            if self._timer.running:
-                self._timer.inc_with_round(-60)
-            else:
-                self._timer.start()
-
         self._display.fill(self._color)
-        self._segmented_text.write(self._timer.current(), 8, 25, 0xFF)
-
-        if not self._timer.running:
+        self._segmented_text.write(self._text, 8, 25, 0xFF)
+        if self._is_paused:
             self._pause_icon.show(3, 3)
+    
+    def set_paused(self, value):
+        self._is_paused = value
+        
+    def set_text(self, value):
+        self._text = value
 
 
-class State:
-    def __init__(self, *, keys: Keys, pause_icon: PauseIcon, segmented_text: SegmentedText, display: OLED):
+class MockScreenPresenter(object):
+    def __init__(self, *, color: int, display: OLED):
+        self._is_paused = False
+        self._text = ''
+
+    def show(self):
+        print(f"Text = {self._text}")
+        print(f"Is Paused = {self._is_paused}")
+    
+    def set_paused(self, value):
+        self._is_paused = value
+        
+    def set_text(self, value):
+        self._text = value
+
+
+class State:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+    def __init__(self, *, pause_icon: PauseIcon, segmented_text: SegmentedText, display: OLED, rotary: RotaryIRQ):
         self._display = display
         self._beep = Beep()
-        self._timers = [
-            Timer(on_alarm=lambda _: self._beep.enabled(True)),
-        ]
-        self.screens: [Screen] = [
-            TimerScreen(timer=self._timers[0], color=0x00, keys=keys, display=display),
-        ]
-        self._current_screen_index = 0
-        self._keys = keys
-        self._keys.on_key_pressed = self._on_key_pressed
-        self.pause_icon = pause_icon
-        self.segmented_text = segmented_text
+        self._rotary = rotary
+        self._rotary.add_listener(lambda *a: print("rot:"+repr(a)))
+        self._timer = Timer(
+            on_alarm=lambda _: self._beep.enabled(True),
+            on_alarm_off=lambda _: self._beep.enabled(False))
+#         self._screen = ScreenPresenter(color=0x00, display=display)
+        self._screen = ScreenPresenter(color=0x00, display=display)
+        
+        self._key = Key(20)
+        self._key.on_key = self._on_key_pressed
+        self._rotary.on_changed = self._on_rotary_changed
 
-    def _show_screen(self, screen_index):
-        this = self
-
-        def show_screen(_initiator):
-            this._current_screen_index = screen_index
-            this._beep.enabled(True)
-
-        return show_screen
-
-    def _on_key_pressed(self, _keys, _keys_event):
-        self._beep.enabled(False)
+    def _on_key_pressed(self, source, value):
+        print(f"on_key_pressed {value}")
+        
+        if value == 1:
+            if self._timer.in_alarm:
+                self._timer.in_alarm = False
+            else:            
+                self._timer.toggle()
+                self._screen.set_paused(not self._timer.running)
+            
+        
+    def _on_rotary_changed(self, source: Rotary, new_value, old_value):
+        print("on_change")
+        print(f"Rotary = {old_value} {new_value}")
+        new_value = abs(new_value)
+        if new_value <= 6:
+            self._timer.alarm_in = new_value * 10
+        else:
+            self._timer.alarm_in = (new_value - 6) * 60
+            
+        self._timer.in_alarm = False
 
     def tick(self) -> None:
-        for timer in self._timers:
-            timer.tick()
-        self._keys.tick()
+        self._timer.tick()
         self._beep.tick()
+        self._rotary.tick()
 
-        self.screens[0].show()
+        self._screen.set_text(self._timer.current())
+        self._screen.show()
 
+class Rotary(RotaryIRQ):
+    def __init__(self, on_changed=None, on_pressed=None):
+        super().__init__(
+            pin_num_clk=18,
+            pin_num_dt=19,
+            min_val=0,
+            max_val = 300,
+            reverse=True,
+            pull_up=True,
+            invert=False,
+            range_mode=RotaryIRQ.RANGE_UNBOUNDED)
+        
+        self._old_value = 0
+        self._new_value = 0
+        self.on_changed = on_changed
 
+    def tick(self):
+        self._new_value = self.value()
+        if self._new_value != self._old_value:
+            self._on_changed()
+            self._old_value = self._new_value
+
+    def _on_changed(self,):
+        if self.on_changed:
+            self.on_changed(self, self._new_value, self._old_value)
+            
+
+rotary = Rotary()
 display = OLED()
 display.show()
-state = State(keys=Keys(), pause_icon=PauseIcon(display), segmented_text=SegmentedText(display), display=display)
+
+state = State(pause_icon=PauseIcon(display), segmented_text=SegmentedText(display), display=display, rotary=rotary)
 while True:
     state.tick()
 
     display.show()
-    time.sleep_ms(100)
+    time.sleep_ms(500)
